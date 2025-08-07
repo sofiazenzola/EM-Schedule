@@ -1,0 +1,210 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+library(dplyr)
+library(lubridate)
+library(tidyr)
+```
+
+```{r}
+# ----------------------------
+# Setup
+# ----------------------------
+set.seed(42)
+start_date <- as.Date("2025-05-01")
+end_date <- as.Date("2025-05-31")
+dates <- seq.Date(start_date, end_date, by = "day")
+holidays <- as.Date(c("2025-05-27"))  # Memorial Day
+
+# Sample doctors
+doctors <- data.frame(
+  doctor_id = paste0("D", sprintf("%03d", 1:10)),
+  role = rep(c("Senior", "Junior"), each = 5),
+  stringsAsFactors = FALSE
+)
+
+# Sample time-off
+doctor_time_off <- data.frame(
+  doctor_id = c("D001", "D004", "D007"),
+  day_off = as.Date(c("2025-05-05", "2025-05-12", "2025-05-17"))
+)
+```
+
+```{r}
+# ----------------------------
+# Simulate Patient Arrivals
+# ----------------------------
+simulate_patient_arrivals <- function(dates) {
+  expand.grid(date = dates, hour = 0:23) %>%
+    mutate(
+      is_weekend = wday(date) %in% c(1, 7),
+      is_holiday = date %in% holidays,
+      base_lambda = case_when(
+        hour >= 7 & hour < 11 ~ 5,
+        hour >= 11 & hour < 15 ~ 8,
+        hour >= 15 & hour < 20 ~ 10,
+        hour >= 20 & hour < 23 ~ 6,
+        hour >= 23 | hour < 7 ~ 2,
+        TRUE ~ 3
+      ),
+      adjusted_lambda = base_lambda * ifelse(is_weekend | is_holiday, 1.2, 1),
+      patients = rpois(n(), lambda = adjusted_lambda)
+    )
+}
+
+arrival_data <- simulate_patient_arrivals(dates)
+
+# ----------------------------
+# Calculate Average Patients per Hour
+# ----------------------------
+avg_patients_per_hour <- mean(arrival_data$patients)
+```
+
+```{r}
+# ----------------------------
+# Define Shift Templates
+# ----------------------------
+shift_templates <- tribble(
+  ~shift,      ~role,   ~start_hour, ~end_hour, ~is_flex, ~min_required, ~ED_TYPE,
+  "7a-3p",     "Senior", 7,          15,        FALSE,     1,             "Adult",
+  "3p-11p",    "Senior", 15,         23,        FALSE,     1,             "Adult",
+  "11p-7a",    "Senior", 23,         31,        FALSE,     1,             "Adult",
+  "1p-9p",     "Senior", 13,         21,        TRUE,      0,             "Adult",
+  "11a-9p",    "Junior", 11,         21,        FALSE,     1,             "Adult",
+  "9p-7a",     "Junior", 21,         31,        FALSE,     1,             "Adult",
+  "1p-11p",    "Junior", 13,         23,        TRUE,      0,             "Adult",
+  "7a-3p",     "Senior", 7,          15,        FALSE,     1,             "Peds",
+  "3p-11p",    "Senior", 15,         23,        FALSE,     1,             "Peds",
+  "11p-7a",    "Senior", 23,         31,        FALSE,     1,             "Peds",
+  "1p-9p",     "Senior", 13,         21,        TRUE,      0,             "Peds"
+)
+```
+
+
+```{r}
+# ----------------------------
+# Generate Shift Demand Table
+# ----------------------------
+generate_shift_demand <- function(arrival_data, shift_templates, avg_patients_per_hour) {
+  shift_needs <- list()
+  for (i in 1:nrow(shift_templates)) {
+    shift <- shift_templates[i, ]
+    for (d in unique(arrival_data$date)) {
+      d <- as.Date(d)
+      shift_hours <- shift$start_hour:(shift$end_hour - 1)
+      shift_hours <- shift_hours %% 24
+      subset <- arrival_data %>%
+        filter(date == d, hour %in% shift_hours)
+      
+      total_patients <- sum(subset$patients)
+      # Adjust extra required doctors logic 
+      # based on the average number of patients per hour
+      extra_required <- floor(total_patients / avg_patients_per_hour) - shift$min_required
+      extra_required <- ifelse(extra_required < 0, 0, extra_required)
+      
+      shift_needs[[length(shift_needs) + 1]] <- data.frame(
+        date = d,
+        shift = shift$shift,
+        role = shift$role,
+        min_required = shift$min_required,
+        extra_required = extra_required,
+        is_flex = shift$is_flex,
+        is_weekend = wday(d) %in% c(1, 7),
+        is_holiday = d %in% holidays,
+        type = ifelse(shift$start_hour >= 7 & shift$start_hour < 19, "day", "night"),
+        ED_TYPE = shift$ED_TYPE
+      )
+    }
+  }
+  bind_rows(shift_needs)
+}
+
+shift_demand <- generate_shift_demand(arrival_data, shift_templates, avg_patients_per_hour)
+```
+
+```{r}
+# ----------------------------
+# Block Schedule Table
+# ----------------------------
+block_schedule <- data.frame(
+  doctor_id = rep(doctors$doctor_id, each = 5),
+  rotation_name = rep(c("UHB ED", "KCH ED", "Tox", "ICU"), times = 25),
+  start_date = rep(seq.Date(from = as.Date("2025-07-01"), by = "2 weeks", length.out = 5), times = 10),
+  end_date = rep(seq.Date(from = as.Date("2025-07-14"), by = "2 weeks", length.out = 5), times = 10)
+)
+```
+
+```{r}
+# Filter doctor table by block schedule (UHB ED and block 1)
+doctor_stats <- doctors %>%
+  filter(doctor_id %in% block_schedule$doctor_id[block_schedule$rotation_name == "UHB ED" & block_schedule$start_date == as.Date("2025-07-01")])
+
+# ----------------------------
+# Assignment Logic
+# ----------------------------
+assignments <- shift_demand %>%
+  mutate(needed = min_required + extra_required) %>%
+  slice(rep(1:n(), needed)) %>%
+  arrange(date)
+
+# Initialize doctor tracking
+doctor_stats <- doctor_stats %>%
+  mutate(
+    total_shifts = 0,
+    weekday_shifts = 0,
+    weekend_shifts = 0,
+    day_shifts = 0,
+    night_shifts = 0,
+    holiday_shifts = 0,
+    last_day = as.Date(NA),
+    streak = 0
+  )
+
+assignments$assigned <- NA
+
+for (i in 1:nrow(assignments)) {
+  row <- assignments[i, ]
+  candidates <- doctor_stats %>%
+    filter(role == row$role) %>%
+    filter(!(doctor_id %in% doctor_time_off$doctor_id[doctor_time_off$day_off == row$date])) %>%
+    filter(!(weekdays(row$date) == "Wednesday" & row$type == "day")) %>%
+    filter(is.na(last_day) | row$date - last_day <= 6) %>%
+    mutate(
+      penalty = abs(day_shifts - night_shifts) +
+                weekend_shifts +
+                holiday_shifts
+    ) %>%
+    arrange(total_shifts, penalty)
+
+  if (nrow(candidates) > 0) {
+    selected <- candidates$doctor_id[1]
+    assignments$assigned[i] <- selected
+
+    # Update tracking
+    doctor_stats <- doctor_stats %>%
+      mutate(
+        total_shifts = ifelse(doctor_id == selected, total_shifts + 1, total_shifts),
+        weekday_shifts = ifelse(doctor_id == selected & !row$is_weekend, weekday_shifts + 1, weekday_shifts),
+        weekend_shifts = ifelse(doctor_id == selected & row$is_weekend, weekend_shifts + 1, weekend_shifts),
+        holiday_shifts = ifelse(doctor_id == selected & row$is_holiday, holiday_shifts + 1, holiday_shifts),
+        day_shifts = ifelse(doctor_id == selected & row$type == "day", day_shifts + 1, day_shifts),
+        night_shifts = ifelse(doctor_id == selected & row$type == "night", night_shifts + 1, night_shifts),
+        last_day = ifelse(doctor_id == selected, row$date, last_day),
+        streak = ifelse(doctor_id == selected, streak + 1, ifelse(last_day != row$date - 1, 0, streak))
+      )
+  }
+}
+```
+
+```{r}
+# ----------------------------
+# Results
+# ----------------------------
+head(assignments)
+
+```
+
